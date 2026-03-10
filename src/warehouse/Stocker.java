@@ -2,18 +2,24 @@ package warehouse;
 
 import java.util.Map;
 import java.util.EnumMap;
+import java.util.Random;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.Collections;
 
 public class Stocker implements Runnable {
     private final String id;
     private final StagingArea staging;
     private final Section[] sections;
     private final TrolleyPool pool;
+    private final Random rand;
 
     public Stocker(int num, StagingArea staging, Section[] sections, TrolleyPool pool) {
         this.id = "S" + num;
         this.staging = staging;
         this.sections = sections;
         this.pool = pool;
+        this.rand = new Random();
     }
 
     @Override
@@ -26,10 +32,12 @@ public class Stocker implements Runnable {
                 Trolley t = pool.acquire();
                 Logger.log(id, "acquire_trolley", "trolley_id=" + t.id + " waited_ticks=0");
 
-                // load up to 10 boxes onto trolley
+                // load up to 10 boxes onto trolley; shuffle categories to avoid bias
                 Map<SectionType,Integer> load = new EnumMap<>(SectionType.class);
                 int total = 0;
-                for (SectionType s : SectionType.values()) {
+                List<SectionType> types = new ArrayList<>(List.of(SectionType.values()));
+                Collections.shuffle(types, rand);
+                for (SectionType s : types) {
                     int num = delivery.getOrDefault(s, 0);
                     if (total + num > 10) {
                         num = 10 - total;
@@ -87,6 +95,14 @@ public class Stocker implements Runnable {
                         }
                     } finally {
                         sec.unlockSection();
+                    }
+                    if (stocked == 0) {
+                        // section was full and we couldn't add anything; stop trying to
+                        // deliver the rest of this trolley so we return to staging and
+                        // pick up a new delivery instead of looping forever.
+                        Logger.log(id, "stock_end", "section=" + sec.name.toLowerCase() + " stocked=" + stocked + " remaining_load=" + remaining + " trolley_id=" + t.id);
+                        // break out of inner delivery loop
+                        break;
                     }
                     remaining -= stocked;
                     load.put(nextType, toStock - stocked);
