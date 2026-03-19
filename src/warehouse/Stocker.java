@@ -13,30 +13,75 @@ public class Stocker implements Runnable {
     private final Section[] sections;
     private final TrolleyPool pool;
     private final Random rand;
+    private final int breakMin;
+    private final int breakMax;
+    private final int breakDuration;
 
-    public Stocker(int num, StagingArea staging, Section[] sections, TrolleyPool pool) {
+    private long nextBreakTick;
+
+    private volatile boolean waiting = false;
+
+    public boolean isWaiting() {
+        return waiting;
+    }
+
+    public Stocker(int num, StagingArea staging, Section[] sections, TrolleyPool pool, int breakMin, int breakMax, int breakDuration) {
         this.id = "S" + num;
         this.staging = staging;
         this.sections = sections;
         this.pool = pool;
         this.rand = new Random();
+        this.breakMin = breakMin;
+        this.breakMax = breakMax;
+        this.breakDuration = breakDuration;
+        scheduleNextBreak();
+    }
+
+    private void scheduleNextBreak() {
+        long now = Tick.current();
+        int interval = breakMin + rand.nextInt(breakMax - breakMin + 1);
+        nextBreakTick = now + interval;
     }
 
     @Override
     public void run() {
         try {
             while (!Thread.currentThread().isInterrupted()) {
+                // Check for break
+                long now = Tick.current();
+                if (now >= nextBreakTick) {
+                    Logger.log(id, "break_start", "duration_ticks=" + breakDuration);
+                    Tick.sleepTicks(breakDuration);
+                    Logger.log(id, "break_end", "duration_ticks=" + breakDuration);
+                    scheduleNextBreak();
+                    continue;
+                }
                 // take delivery from staging (blocking)
+                waiting = true;
+                Logger.log(id, "wait_delivery", "Waiting for delivery at staging area");
                 Map<SectionType,Integer> delivery = staging.takeDelivery();
+                waiting = false;
                 // acquire trolley
+                waiting = true;
+                Logger.log(id, "wait_trolley", "Waiting for trolley");
                 Trolley t = pool.acquire();
+                waiting = false;
                 Logger.log(id, "acquire_trolley", "trolley_id=" + t.id + " waited_ticks=0");
 
-                // load up to 10 boxes onto trolley; shuffle categories to avoid bias
+                // load up to 10 boxes onto trolley; prioritize sections with most pickers waiting or empty
                 Map<SectionType,Integer> load = new EnumMap<>(SectionType.class);
                 int total = 0;
                 List<SectionType> types = new ArrayList<>(List.of(SectionType.values()));
-                Collections.shuffle(types, rand);
+                // Sort by: (1) number of waiting pickers (desc), (2) if section is empty (desc)
+                types.sort((a, b) -> {
+                    Section sa = getSection(a);
+                    Section sb = getSection(b);
+                    int cmp = Integer.compare(sb.getWaitingPickers(), sa.getWaitingPickers());
+                    if (cmp != 0) return cmp;
+                    // Prefer empty sections
+                    cmp = Integer.compare((sa.getCount() == 0 ? 1 : 0), (sb.getCount() == 0 ? 1 : 0));
+                    return -cmp;
+                });
                 for (SectionType s : types) {
                     int num = delivery.getOrDefault(s, 0);
                     if (total + num > 10) {
@@ -96,27 +141,30 @@ public class Stocker implements Runnable {
                     } finally {
                         sec.unlockSection();
                     }
+                    // Always log stock_end with stocked and remaining_load
+                    Logger.log(id, "stock_end", "section=" + sec.name.toLowerCase() + " stocked=" + stocked + " remaining_load=" + (remaining) + " trolley_id=" + t.id);
                     if (stocked == 0) {
                         // section was full and we couldn't add anything; stop trying to
                         // deliver the rest of this trolley so we return to staging and
                         // pick up a new delivery instead of looping forever.
-                        Logger.log(id, "stock_end", "section=" + sec.name.toLowerCase() + " stocked=" + stocked + " remaining_load=" + remaining + " trolley_id=" + t.id);
-                        // break out of inner delivery loop
                         break;
                     }
                     remaining -= stocked;
                     load.put(nextType, toStock - stocked);
-                    Logger.log(id, "stock_end", "section=" + sec.name.toLowerCase() + " stocked=" + stocked + " remaining_load=" + remaining + " trolley_id=" + t.id);
                     current = sec;
                 }
 
                 // return to staging
                 Logger.log(id, "move", "from=" + (current==null?"staging":current.name.toLowerCase()) + " to=staging load=" + remaining + " trolley_id=" + t.id);
                 Tick.sleepTicks(10 + remaining);
-                // release trolley
-                Logger.log(id, "release_trolley", "trolley_id=" + t.id + " remaining_load=" + remaining);
-                pool.release(t);
-                t.load = 0;
+                // Only release trolley if remaining_load == 0
+                if (remaining > 0) {
+                    Logger.log(id, "trolley_not_released", "trolley_id=" + t.id + " remaining_load=" + remaining + " (trolley held, not released)");
+                } else {
+                    Logger.log(id, "release_trolley", "trolley_id=" + t.id + " remaining_load=0");
+                    pool.release(t);
+                    t.load = 0;
+                }
                 // leftover boxes remain in staging area implicitly (ignored for now)
             }
         } catch (InterruptedException e) {

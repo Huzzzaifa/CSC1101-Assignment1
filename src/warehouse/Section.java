@@ -3,10 +3,13 @@ package warehouse;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 public class Section {
     public final String name;
     private final int capacity;
     private int count;
+    private final AtomicInteger waitingPickers = new AtomicInteger(0);
 
     private final ReentrantLock lock = new ReentrantLock(true);
     private final Condition notEmpty = lock.newCondition();
@@ -41,12 +44,29 @@ public class Section {
      * Caller must hold the section lock.
      */
     public boolean takeBox() throws InterruptedException {
-        while (count == 0) {
-            notEmpty.await();
+        waitingPickers.incrementAndGet();
+        try {
+            while (count == 0) {
+                notEmpty.await();
+            }
+            count--;
+            notFull.signal();
+            return true;
+        } finally {
+            waitingPickers.decrementAndGet();
         }
-        count--;
-        notFull.signal();
-        return true;
+    }
+    public int getWaitingPickers() {
+        return waitingPickers.get();
+    }
+
+    public boolean isEmpty() {
+        lock.lock();
+        try {
+            return count == 0;
+        } finally {
+            lock.unlock();
+        }
     }
 
     /**
